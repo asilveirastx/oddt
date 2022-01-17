@@ -460,6 +460,61 @@ class Molecule(object):
 
     title = property(_gettitle, _settitle)
 
+    def update_trajectory_properties(self, new):
+
+        new = np.asarray(new, dtype=np.float64)
+        if self.Mol.GetNumConformers() == 0:
+            raise AttributeError("Atom has no coordinates (0D structure)")
+        if self.Mol.GetNumAtoms() != new.shape[0]:
+            raise AttributeError("Atom number is unequal. You have to supply new coordinates for all atoms")
+        conformer = self.Mol.GetConformer()
+        for idx in range(self.Mol.GetNumAtoms()):
+            conformer.SetAtomPosition(idx, new[idx, :])
+        self._coords = np.array([atom.coords for atom in self.atoms], dtype=np.float32)
+        for i, atom in enumerate(self.atoms):
+            self._atom_dict[i]['coords'] = atom.coords
+            atomtype = (atom.Atom.GetProp("_TriposAtomType")
+                        if atom.Atom.HasProp("_TriposAtomType")
+                        else _sybyl_atom_type(atom.Atom))
+            # get neighbors, but only for those atoms which realy need them
+            max_neighbors = 6
+            neighbors = np.zeros(max_neighbors, dtype=[('id', np.int16),
+                                                       ('coords', np.float32, 3),
+                                                       ('atomicnum', np.int8)])
+            neighbors['coords'].fill(np.nan)
+            for n, nbr_atom in enumerate(atom.neighbors):
+                if n >= max_neighbors:
+                    warnings.warn('Error while parsing molecule "%s" '
+                                  'for `atom_dict`. Atom #%i (%s) has %i '
+                                  'neighbors (max_neighbors=%i). Additional '
+                                  'neighbors are ignored.' % (self.title,
+                                                              atom.idx0,
+                                                              atomtype,
+                                                              len(atom.neighbors),
+                                                              max_neighbors),
+                                  UserWarning)
+                    break
+                if nbr_atom.atomicnum == 1:
+                    continue
+                neighbors[n] = (nbr_atom.idx0, nbr_atom.coords, nbr_atom.atomicnum)
+            self._atom_dict[i]['neighbors_id'] = neighbors['id']
+            self._atom_dict[i]['neighbors'] = neighbors['coords']
+        for i, ring in enumerate(self._ring_dict):
+            atoms = self._atom_dict[self._aromatic[i]]
+            coords = atoms['coords']
+            centroid = coords.mean(axis=0)
+            ring_vectors = coords - centroid
+            vector = np.cross(ring_vectors, np.roll(ring_vectors, shift=-1, axis=0)).mean(axis=0)
+            self.ring_dict[i]['centroid'] = centroid
+            self.ring_dict[i]['vector'] = vector
+        if self.protein:
+            for i, res in enumerate(self._res_dict):
+                if self._backbone[i][2] is not None:
+                    coords = self._atom_dict[self._backbone[i]]['coords']
+                    self._res_dict[i][3] = coords[0]
+                    self._res_dict[i][4] = coords[1]
+                    self._res_dict[i][5] = coords[2]
+
     @property
     def _exchange(self):
         if self.Mol.GetNumConformers() == 0:
@@ -687,7 +742,7 @@ class Molecule(object):
                       ('isalpha', bool),
                       ('isbeta', bool),
                       ]
-
+         
         atom_dict = np.empty(self.Mol.GetNumAtoms(), dtype=atom_dtype)
         metals = [3, 4, 11, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
                   30, 31, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
@@ -728,6 +783,7 @@ class Molecule(object):
                 if nbr_atom.atomicnum == 1:
                     continue
                 neighbors[n] = (nbr_atom.idx0, nbr_atom.coords, nbr_atom.atomicnum)
+
             assert i == atom.idx0
             atom_dict[i] = (atom.idx0,
                             coords,
@@ -802,7 +858,6 @@ class Molecule(object):
         matches = np.array(self.Mol.GetSubstructMatches(patt, maxMatches=5000)).flatten()
         if len(matches) > 0:
             atom_dict['isminus'][np.intersect1d(matches, not_carbon)] = True
-
         # build residue dictionary
         if self.protein:
             # for protein finding features per residue is much faster
@@ -818,7 +873,10 @@ class Molecule(object):
                          ('isalpha', bool),
                          ('isbeta', bool)
                          ]  # N, CA, C, O
+             
             b = []
+            j = 0
+            self._backbone = {}
             aa = Chem.MolFromSmarts('NCC(-,=O)')  # amino backbone SMARTS
             conf = self.Mol.GetConformer()
             for residue in self.residues:
@@ -835,8 +893,51 @@ class Molecule(object):
                               conf.GetAtomPosition(residue.atommap[path[3]]),
                               False,
                               False))
+                    self._backbone[j] = [residue.atommap[path[0]], residue.atommap[path[1]], residue.atommap[path[2]]]
+                    j += 1
                     # set resid for atoms in atom_dict
                     atom_dict['resid'][list(residue.atommap.values())] = residue.idx0
+
+                else:  # TRY NME/ACE
+                    ace = Chem.MolFromSmarts('CC(-,=O)')
+                    path = residue.Residue.GetSubstructMatch(ace)
+                    if path:
+                        backbone_map = np.array([residue.atommap[i] for i in path])
+                        atom_dict['isbackbone'][backbone_map] = False
+                        b.append((residue.idx0,
+                                  residue.number,
+                                  residue.name,
+                                  conf.GetAtomPosition(residue.atommap[path[0]]),
+                                  conf.GetAtomPosition(residue.atommap[path[1]]),
+                                  conf.GetAtomPosition(residue.atommap[path[2]]),
+                                  None,
+                                  False,
+                                  False))
+                        self._backbone[j] = [residue.atommap[path[0]], residue.atommap[path[1]], residue.atommap[path[2]]]
+                        j += 1
+                        # set resid for atoms in atom_dict
+                        atom_dict['resid'][list(residue.atommap.values())] = residue.idx0
+                
+                    else:
+                        nme = Chem.MolFromSmarts('NC')
+                        path = residue.Residue.GetSubstructMatch(nme)
+                        if path:
+                            backbone_map = np.array([residue.atommap[i] for i in path])
+                            atom_dict['isbackbone'][backbone_map] = False
+                            b.append((residue.idx0,
+                                      residue.number,
+                                      residue.name,
+                                      conf.GetAtomPosition(residue.atommap[path[0]]),
+                                      conf.GetAtomPosition(residue.atommap[path[1]]),
+                                      None,
+                                      None,
+                                      False,
+                                      False))
+                            self._backbone[j] = [residue.atommap[path[0]], residue.atommap[path[1]], None]
+                            j += 1
+                            # set resid for atoms in atom_dict
+                            atom_dict['resid'][list(residue.atommap.values())] = residue.idx0
+    
             res_dict = np.array(b, dtype=res_dtype)
             res_dict = detect_secondary_structure(res_dict)
             alpha_mask = np.in1d(atom_dict['resid'],
@@ -851,7 +952,9 @@ class Molecule(object):
                              (atom_dict['atomicnum'] == 6)] = False
 
         # Aromatic Rings
+        self._aromatic = {}
         r = []
+        j = 0
         for path in self.sssr:
             if self.Mol.GetAtomWithIdx(path[0]).GetIsAromatic():
                 atoms = atom_dict[canonize_ring_path(path)]
@@ -869,6 +972,8 @@ class Molecule(object):
                               atom['resname'],
                               atom['isalpha'],
                               atom['isbeta']))
+                    self._aromatic[j] = canonize_ring_path(path)
+                    j += 1
         ring_dict = np.array(r, dtype=[('centroid', np.float32, 3),
                                        ('vector', np.float32, 3),
                                        ('resid', np.int16),
@@ -878,9 +983,9 @@ class Molecule(object):
                                        ('isbeta', bool)])
 
         self._atom_dict = atom_dict
-        self._atom_dict.setflags(write=False)
+        self._atom_dict.setflags(write=True)
         self._ring_dict = ring_dict
-        self._ring_dict.setflags(write=False)
+        self._ring_dict.setflags(write=True)
         if self.protein:
             self._res_dict = res_dict
             # self._res_dict.setflags(write=False)
